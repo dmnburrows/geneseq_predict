@@ -39,8 +39,6 @@ from tqdm import tqdm
 import itertools
 
 
-
-
 #find locations, regions
 #=========================
 loc_df=pd.read_csv(f'{fdata}/GENOME/scn1a/scn1a_aaron/4_SCN1A_variants_borzoi.bed', sep='\t').iloc[:,0].reset_index()
@@ -53,16 +51,15 @@ a1_df = pd.read_csv(f'{fdata}/GENE_PREDICT/importance_score/a1_20bp_single-ism_A
 #=================
 fasta = pysam.FastaFile(f"{fdata}/GENOME/annotations/hg38/assembly/ucsc/hg38.fa")
 
-
 #load models
 #=========================
 from alphagenome_research.model import dna_model
 model = dna_model.create_from_huggingface("all_folds")
-fold0 = dna_model.create_from_huggingface("fold_0")
-fold1 = dna_model.create_from_huggingface("fold_1")
-fold2 = dna_model.create_from_huggingface("fold_2")
-fold3 = dna_model.create_from_huggingface("fold_3")
-model_l = [fold0, fold1, fold2, fold3]
+# fold0 = dna_model.create_from_huggingface("fold_0")
+# fold1 = dna_model.create_from_huggingface("fold_1")
+# fold2 = dna_model.create_from_huggingface("fold_2")
+# fold3 = dna_model.create_from_huggingface("fold_3")
+# model_l = [fold0, fold1, fold2, fold3]
 print("Models loaded.")
 
 
@@ -84,10 +81,10 @@ def mean_reg(model=None, seq=None, chro=None, interval=None, brain_terms=None):
 #expression across models
 def expr_map(all_model = None, model_l=None, seq=None, chro=None, interval=None, brain_terms=None):
     point_est = mean_reg(model=all_model, seq=seq, chro=chro, interval=interval, brain_terms=brain_terms)
-    fold_l = list(range(len(model_l)))
-    for v,mo in enumerate(model_l):
-        fold_l[v] = mean_reg(model=mo, seq=seq, chro=chro, interval=interval, brain_terms=brain_terms)
-    return(point_est, np.array(fold_l))
+    # fold_l = list(range(len(model_l)))
+    # for v,mo in enumerate(model_l):
+    #     fold_l[v] = mean_reg(model=mo, seq=seq, chro=chro, interval=interval, brain_terms=brain_terms)
+    return(point_est)#, np.array(fold_l))
 
 #mutate arbitrary sequence
 def mutate_seq(seq, pos, base):
@@ -104,13 +101,14 @@ def mutate_seq(seq, pos, base):
     return "".join(seq)
 
 # mask sites to mutate over
-def mask(mode=None, neg_thr=-0.03, neu_thr=(-0.03,0.05), reg=None, curr_df=None):
+def mask(mode=None, neg_thr=-0.03, neu_thr=(-0.03,0.06), reg=None, curr_df=None):
     mins = curr_df.groupby('pos')['logFC'].min()
-
+    maxs = curr_df.groupby('pos')['logFC'].max()
     if mode == 'neg':
         keep_pos = mins[mins < neg_thr].index
     elif mode == 'neu':
-        keep_pos = mins[(mins > neu_thr[0]) & (mins < neu_thr[1])].index
+        
+        keep_pos = mins[(mins > neu_thr[0]) & (maxs < neu_thr[1])].index
     else:
         print('mode must equal neg or neu')
         return None
@@ -154,7 +152,7 @@ def process(loc_df=None, scn1a_df = None, fasta = None, win_len=1048576, reg=Non
 
 def _run(reg, mode, curr_df):
     #models
-    model_l = [fold0, fold1, fold2, fold3]
+    #model_l = [fold0, fold1, fold2, fold3]
     
     # Brain-associated ontology terms 
     brain_terms = {
@@ -184,14 +182,14 @@ def _run(reg, mode, curr_df):
     
     #generate baseline
     #======================
-    baseline,_ = expr_map(all_model=model, model_l = model_l, seq=seq, chro=chro, interval=interval, brain_terms=brain_terms)
+    baseline = expr_map(all_model=model, seq=seq, chro=chro, interval=interval, brain_terms=brain_terms)
     base_mean = np.mean(baseline[gene_rel_start:gene_rel_end])
     
     # #Run ISM
     # #=================
     #Define mask
     neg_thr = -0.03
-    neu_thr = (-0.03,0.05)
+    neu_thr = (-0.03,0.06)
     mask_df = mask(mode = mode, neg_thr = neg_thr, neu_thr = neu_thr,
                    reg=reg, curr_df = curr_df)
     mask_rel_pos = np.array(mask_df.index.unique())
@@ -222,9 +220,9 @@ def _run(reg, mode, curr_df):
         mut_seq = ''.join(mut_seq)
         
         # predict
-        point, fold_outs = expr_map(
+        point = expr_map(
             all_model=model,
-            model_l=model_l,
+            #model_l=model_l,
             seq=mut_seq,
             chro=chro,
             interval=interval,
@@ -233,7 +231,7 @@ def _run(reg, mode, curr_df):
         
         mut_mean = np.mean(point[gene_rel_start:gene_rel_end])
         logFC = np.log2((mut_mean + 1e-8) / (base_mean + 1e-8))
-        sd = np.mean(np.std(fold_outs[:,gene_rel_start:gene_rel_end],axis=0))
+        #sd = np.mean(np.std(fold_outs[:,gene_rel_start:gene_rel_end],axis=0))
         
         rows.append({
             'reg': reg,
@@ -246,7 +244,7 @@ def _run(reg, mode, curr_df):
             'base_mean': base_mean,
             'delta': mut_mean - base_mean,
             'logFC': logFC,
-            'sd': sd
+            #'sd': sd
         })
     
     comb_df = pd.DataFrame(rows).sort_values('logFC')
