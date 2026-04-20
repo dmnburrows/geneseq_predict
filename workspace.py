@@ -1,340 +1,265 @@
-import json
+#imports
+#GPU
+
+import sys, os
+print("Python:", sys.executable)
+print("LD_LIBRARY_PATH:", repr(os.environ.get("LD_LIBRARY_PATH")))
+print("CUDA_HOME:", repr(os.environ.get("CUDA_HOME")))
+print("CUDA_PATH:", repr(os.environ.get("CUDA_PATH")))
+
+import jax
+print("JAX:", jax.__version__)
+print("Devices:", jax.devices())
+
 import os
-import sys
+from pathlib import Path
+fdata='/home/dburrows/DATA/'
+
+
+hf_home = Path(f"{fdata}/GENE_PREDICT/models/alphagenome/hf_home")
+hf_home.mkdir(parents=True, exist_ok=True)
+
+os.environ["HF_HOME"] = str(hf_home)
+# optional, but makes it explicit:
+os.environ["HF_HUB_CACHE"] = str(hf_home / "hub")
+
+from alphagenome_research.model import dna_model
+import numpy as np
+import pandas as pd
+import os
+
+import jax
+import alphagenome
+import alphagenome_research
+from alphagenome.data import genome
+from alphagenome.models import dna_client
 import time
-import warnings
-import h5py
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
-import numpy as np
-import pandas as pd
 import pysam
-import pyfaidx 
-import pyranges as pr
-import tensorflow as tf
-
-from baskerville import seqnn
-from baskerville import gene as bgene
-from baskerville import dna
-
-sys.path.insert(0,'/Users/k2585057/borzoi/')
-from examples.borzoi_helpers import *
-
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
-#os.environ['CUDA_VISIBLE_DEVICES'] = '-1'
-
-bz_path = '/Users/k2585057/borzoi/'
-gn_path = '/Users/k2585057/Dropbox/PhD/Analysis/Project/GENOME/'
+from tqdm import tqdm
+import itertools
 
 
-import numpy as np
-import pandas as pd
 
-def process(models, wt_code, mut_code,
-                                      window_start, window_end,
-                                      gene_start, gene_end,
-                                      channel_indices,
-                                      channel_aggregate='mean',
-                                      bin_normalize=False,
-                                      reduce='sum',
-                                      pseudocount=1e-6):
-    """
-    Returns:
-      df: tidy per-fold dataframe (WT & MUT gene-level expr, delta, log2FC)
-      tracks: dict with:
-        x            (Nbins,)
-        wt_tracks    (F, Nbins)
-        mut_tracks   (F, Nbins)
-        resid_tracks (F, Nbins)  = mut - wt
-        wt_mean, wt_sd           (Nbins,)
-        mut_mean, mut_sd         (Nbins,)
-        resid_mean, resid_sd     (Nbins,)
-    Notes:
-      - bin_normalize=False recommended for expression deltas/log2FC.
-      - region used for tracks is the gene span [min(gene_start, gene_end), max(...)].
-    """
-    # region (ascending coords)
-    region_start = min(gene_start, gene_end)
-    region_end   = max(gene_start, gene_end)
 
-    # to collect fold-level tracks & scalars
-    wt_tracks, mut_tracks, resid_tracks = [], [], []
-    records = []
+#find locations, regions
+#=========================
+loc_df=pd.read_csv(f'{fdata}/GENOME/scn1a/scn1a_aaron/4_SCN1A_variants_borzoi.bed', sep='\t').iloc[:,0].reset_index()
+scn1a_df=pd.read_csv(f'{fdata}/GENOME/scn1a/scn1a_aaron/1_SCN1A_gene.bed', sep='\t', header=None)
+b1_df = pd.read_csv(f'{fdata}/GENE_PREDICT/importance_score/b1_20bp_single-ism_AG.csv', index_col=0)
+b2_df = pd.read_csv(f'{fdata}/GENE_PREDICT/importance_score/b2_20bp_single-ism_AG.csv', index_col=0)
+a1_df = pd.read_csv(f'{fdata}/GENE_PREDICT/importance_score/a1_20bp_single-ism_AG.csv', index_col=0)
 
-    x_ref = None  # will capture bin centers once
+#Load genome seq
+#=================
+fasta = pysam.FastaFile(f"{fdata}/GENOME/annotations/hg38/assembly/ucsc/hg38.fa")
 
-    for fold_ix, mdl in enumerate(models):
-        # per-fold predictions (IMPORTANT: wrap single model)
-        y_wt_f  = predict_tracks([mdl], wt_code)  # (1,1,B,T)
-        y_mut_f = predict_tracks([mdl], mut_code)
 
-        # --- aggregate channels & slice region (returns x_reg, t_reg) ---
-        x_wt, t_wt = aggregate_region(y_wt_f,  window_start, window_end,
-                                      region_start, region_end,
-                                      channel_indices, aggregate=channel_aggregate,
-                                      normalize_counts=bin_normalize)
-        x_mut, t_mut = aggregate_region(y_mut_f, window_start, window_end,
-                                        region_start, region_end,
-                                        channel_indices, aggregate=channel_aggregate,
-                                        normalize_counts=bin_normalize)
+#load models
+#=========================
+from alphagenome_research.model import dna_model
+model = dna_model.create_from_huggingface("all_folds")
+fold0 = dna_model.create_from_huggingface("fold_0")
+fold1 = dna_model.create_from_huggingface("fold_1")
+fold2 = dna_model.create_from_huggingface("fold_2")
+fold3 = dna_model.create_from_huggingface("fold_3")
+model_l = [fold0, fold1, fold2, fold3]
+print("Models loaded.")
 
-        if x_ref is None:
-            x_ref = x_wt
-        else:
-            # sanity: region binning should match across folds
-            assert np.allclose(x_ref, x_wt), "Inconsistent x bins across folds"
 
-        # gene-level scalars
-        expr_wt  = gene_expression_from_bins(x_wt,  t_wt,  gene_start, gene_end, reduce=reduce)
-        expr_mut = gene_expression_from_bins(x_mut, t_mut, gene_start, gene_end, reduce=reduce)
-        delta    = expr_mut - expr_wt
-        log2fc   = np.log2((expr_mut + pseudocount) / (expr_wt + pseudocount))
+# mean expr
+#===============
+def mean_reg(model=None, seq=None, chro=None, interval=None, brain_terms=None):
+    vals = []
+    for region_name, term in brain_terms.items():
+        pred = model.predict_sequence(
+            sequence=seq,
+            requested_outputs=[dna_model.OutputType.RNA_SEQ],
+            ontology_terms=[term],
+            interval=interval,
+        )
+        vals.append(np.mean(pred.rna_seq.values, axis=1))
+    return np.mean(np.array(vals), axis=0)
 
-        # store tracks
-        wt_tracks.append(t_wt)
-        mut_tracks.append(t_mut)
-        resid_tracks.append(t_mut - t_wt)
 
-        # store rows
-        records.append({'fold': fold_ix, 'condition': 'WT',
-                        'expr': expr_wt, 'delta_vs_WT': 0.0, 'log2FC_vs_WT': 0.0})
-        records.append({'fold': fold_ix, 'condition': 'MUT',
-                        'expr': expr_mut, 'delta_vs_WT': delta, 'log2FC_vs_WT': log2fc})
+#expression across models
+def expr_map(all_model = None, model_l=None, seq=None, chro=None, interval=None, brain_terms=None):
+    point_est = mean_reg(model=all_model, seq=seq, chro=chro, interval=interval, brain_terms=brain_terms)
+    fold_l = list(range(len(model_l)))
+    for v,mo in enumerate(model_l):
+        fold_l[v] = mean_reg(model=mo, seq=seq, chro=chro, interval=interval, brain_terms=brain_terms)
+    return(point_est, np.array(fold_l))
 
-    # stack tracks: (F, Nbins)
-    wt_arr    = np.stack(wt_tracks, axis=0)
-    mut_arr   = np.stack(mut_tracks, axis=0)
-    resid_arr = np.stack(resid_tracks, axis=0)
+#mutate arbitrary sequence
+def mutate_seq(seq, pos, base):
+    base = base.upper()
+    if base not in {"A", "C", "G", "T"}:
+        raise ValueError("base must be one of A, C, G, T")
+    if pos < 0 or pos >= len(seq):
+        raise IndexError("pos out of range")
+    if seq[pos].upper() == base:
+        raise ValueError("base is already the same at this position")
 
-    # fold means / sds (per bin)
-    wt_mean, wt_sd         = wt_arr.mean(0), wt_arr.std(0)
-    mut_mean, mut_sd       = mut_arr.mean(0), mut_arr.std(0)
-    resid_mean, resid_sd   = resid_arr.mean(0), resid_arr.std(0)
+    seq = list(seq)
+    seq[pos] = base
+    return "".join(seq)
 
-    # assemble dataframe
-    df = pd.DataFrame.from_records(records)
+# mask sites to mutate over
+def mask(mode=None, neg_thr=-0.03, neu_thr=(-0.03,0.05), reg=None, curr_df=None):
+    mins = curr_df.groupby('pos')['logFC'].min()
 
-    tracks = dict(
-        x=x_ref,
-        wt_tracks=wt_arr, mut_tracks=mut_arr, resid_tracks=resid_arr,
-        wt_mean=wt_mean, wt_sd=wt_sd,
-        mut_mean=mut_mean, mut_sd=mut_sd,
-        resid_mean=resid_mean, resid_sd=resid_sd
-    )
-    return df, tracks
+    if mode == 'neg':
+        keep_pos = mins[mins < neg_thr].index
+    elif mode == 'neu':
+        keep_pos = mins[(mins > neu_thr[0]) & (mins < neu_thr[1])].index
+    else:
+        print('mode must equal neg or neu')
+        return None
 
-def mutate(wt_code, poses, alts):
+    return curr_df[curr_df['pos'].isin(keep_pos)].set_index('pos')
 
-    #Induce mutation(s)
-    mut_code = np.copy(wt_code)
+#get sequence window
+def process(loc_df=None, scn1a_df = None, fasta = None, win_len=1048576, reg=None):
+    curr_df = loc_df[loc_df['level_3'] == reg].copy()
     
-    for pos, alt in zip(poses, alts) :
-        alt_ix = -1
-        if alt == 'A' :
-            alt_ix = 0
-        elif alt == 'C' :
-            alt_ix = 1
-        elif alt == 'G' :
-            alt_ix = 2
-        elif alt == 'T' :
-            alt_ix = 3
+    chro = str(curr_df['level_0'].iloc[0]) 
+    region_start = int(curr_df['level_1'].iloc[0])
+    region_end = int(curr_df['level_2'].iloc[0])
+    cntr = (region_start + region_end) // 2
     
-        mut_code[pos-start-1] = 0.
-        mut_code[pos-start-1, alt_ix] = 1.
-    return(mut_code)
-
-import matplotlib.pyplot as plt
-import seaborn as sns
-
-def plot_foldwise_expression(df, title="SCN1A predicted expression (brain tracks)"):
-    """
-    df: output from foldwise_expression_df
-    """
-    # Pivot for convenience: fold × condition → expr
-    expr_wide = df.pivot(index='fold', columns='condition', values='expr')
-    fold_means = expr_wide.mean()
-    fold_sds   = expr_wide.std()
-
-    plt.figure(figsize=(6,4))
+    start = cntr - (win_len//2)
+    end = cntr + (win_len//2)
+    interval = genome.Interval(chro, start, end)
     
-    # plot per fold as paired dots + lines
-    for fold, row in expr_wide.iterrows():
-        plt.plot(['WT','MUT'], row.values, marker='o', linestyle='-', alpha=0.7, color='gray')
-
-    # overlay mean ± sd
-    plt.errorbar(['WT','MUT'], fold_means.values, yerr=fold_sds.values,
-                 fmt='o', markersize=10, color='black', capsize=5, label='Mean ± SD')
-
-    plt.ylabel("Predicted expression (sum of bins)")
-    plt.title(title)
-    plt.legend(loc='upper left')
-    plt.tight_layout()
-    plt.show()
-
-def plot_foldwise_delta(df, title="Change in expression per fold"):
-    """Plot bar chart of per-fold Δ and log2FC."""
-    mut_rows = df[df['condition']=='MUT'].copy()
-
-    fig, axes = plt.subplots(1, 2, figsize=(10,4))
-
-    sns.barplot(x='fold', y='delta_vs_WT', data=mut_rows, ax=axes[0], color='tab:blue')
-    axes[0].set_title("Δ (MUT − WT)")
-    axes[0].axhline(0, color='k', linewidth=1)
-
-    sns.barplot(x='fold', y='log2FC_vs_WT', data=mut_rows, ax=axes[1], color='tab:orange')
-    axes[1].set_title("log2 Fold Change")
-    axes[1].axhline(0, color='k', linewidth=1)
-
-    fig.suptitle(title)
-    plt.tight_layout()
-    plt.show()
-
-
-
-#load annotations
-#===================================
-#Initialize fasta sequence extractor 
-fasta_open = pysam.Fastafile(f'{gn_path}/annotations/hg38/assembly/ucsc/hg38.fa')
-#Load GTF (optional; needed to compute exon coverage attributions for example gene)
-transcriptome = bgene.Transcriptome(f'{gn_path}/annotations/hg38/genes/gencode41/gencode41_basic_nort.gtf')
-
-#Model configuration
-#=============================
-params_file = f'{bz_path}/examples/params_pred.json'
-targets_file = f'{bz_path}/examples/targets_gtex.txt' #Subset of targets_human.txt
-seq_len = 524288
-rc = True         #Average across reverse-complement prediction
-n_folds = 4       #To use only one model fold, set to 'n_folds = 1'. To use all four folds, set 'n_folds = 4'.
-
-
-#SCN1A promoter positions
-#=============================
-P1a= [166148180, 166151550]
-P1b= [166127360, 166129030]
-P1c= [166077140, 166079490]
-scn1a = [165984641, 166182806]
-
-
-#================================
-#load model params 
-#===================================
-
-#Read model parameters
-with open(params_file) as params_open:
+    #mutation end and start relative to window
+    region_rel_start = (region_start - start)
+    region_rel_end = (region_end - start)
     
-    params = json.load(params_open)
+    #promoter end and start (for gene expression)
+    gene_start = scn1a_df[1].values[0]
+    gene_end = scn1a_df[2].values[0]
+    gene_rel_start = (gene_start - start)
+    gene_rel_end = (gene_end-start)
     
-    params_model = params['model']
-    params_train = params['train']
-
-
-#Read targets
-targets_df = pd.read_csv(targets_file, index_col=0, sep='\t')
-target_index = targets_df.index
-assert all(targets_df['strand_pair'].values == targets_df.index), 'strand pairs dont match indeces - may causes errors later'
-
-#Create local index of strand_pair (relative to sliced targets)
-#THIS SEEMS WEIRD - MAYBE FIX LATER!
-if rc :
-    strand_pair = targets_df.strand_pair 
     
-    target_slice_dict = {ix : i for i, ix in enumerate(target_index.values.tolist())}
-    slice_pair = np.array([
-        target_slice_dict[ix] if ix in target_slice_dict else ix for ix in strand_pair.values.tolist()
-    ], dtype='int32')
+    print(interval)
+    print("Width:", interval.width)
 
-#Initialize model ensemble
-#==========================
-models = []
-for fold_ix in range(n_folds) :
-    model_file = f'/Users/k2585057/Dropbox/PhD/Analysis/Project/SCN1A_PREDICT/BORZOI/saved_models/f3c{str(fold_ix)}/train/model0_best.h5'
-    seqnn_model = seqnn.SeqNN(params_model)
-    seqnn_model.restore(model_file, 0)
-    seqnn_model.build_slice(target_index)
-    if rc :
-        seqnn_model.strand_pair.append(slice_pair)
-    seqnn_model.build_ensemble(rc, [0])
+    seq = fasta.fetch(chro, start, end)
+    return(chro, region_start, 
+           region_end, cntr, interval, 
+           region_rel_start, region_rel_end,
+           gene_start, gene_end, gene_rel_start,
+           gene_rel_end, seq)
+
+
+def _run(reg, mode, curr_df):
+    #models
+    model_l = [fold0, fold1, fold2, fold3]
     
-    models.append(seqnn_model)
-
-
-
-import re
-
-# ====== MINIMAL BATCH: LOOP → PREDICT → SAVE ======
-
-# config you already have
-seq_len   = 524_288
-brain_idx = [17, 18, 19]   # average across these channels
-out_dir   = "borzoi_out_min"
-os.makedirs(out_dir, exist_ok=True)
-
-# SCN1A coords and promoters (minus strand → use lower coord as TSS-ish)
-SCN1A = [165_984_641, 166_182_806]
-P1a = [166_148_180, 166_151_550]
-P1b = [166_127_360, 166_129_030]
-P1c = [166_077_140, 166_079_490]
-prom_TSS = {'P1a': P1a[0], 'P1b': P1b[0], 'P1c': P1c[0]}
-
-# your variant lists
-prom_l = ['P1a', 'P1a', 'P1c', 'P1b', 'P1a', 'P1a']
-mut_l  = ['chr2-166149776-A-T', 'chr2-166150870-T-C', 'chr2-166077919-T-A',
-          'chr2-166128263-G-T', 'chr2-166148245-C-G', 'chr2-166148581-A-C']
-
-def sanitize(v):
-    return re.sub(r'[^A-Za-z0-9_\-\.]', '_', v)
-
-def brain_aggregate(y, idxs):
-    """y shape (1,1,B,T) -> (B,) mean over idxs"""
-    return y[0, 0, :, idxs].mean(axis=1)
-
-for prom_name, var in zip(prom_l, mut_l):
-    chrom, pos_s, ref, alt = var.split('-')
-    pos = int(pos_s)
-
-    centers = {
-        prom_name: prom_TSS[prom_name],
-        'MID': (SCN1A[0] + SCN1A[1]) // 2
+    # Brain-associated ontology terms 
+    brain_terms = {
+        "brain": "UBERON:0000955",
+        "frontal_cortex": "UBERON:0001870",
+        # "caudate_nucleus": "UBERON:0001873",
+        # "putamen": "UBERON:0001874",
+        # "amygdala": "UBERON:0001876",
+        # "nucleus_accumbens": "UBERON:0001882",
+        # "hypothalamus": "UBERON:0001898",
+        "hippocampus_ammons_horn": "UBERON:0001954",
+        # "cerebellum": "UBERON:0002037",
+        # "substantia_nigra": "UBERON:0002038",
+        # "cerebellar_hemisphere": "UBERON:0002245",
+        # "spinal_cord_c1": "UBERON:0006469",
+        "dlpfc_ba9": "UBERON:0009834",
+        "anterior_cingulate_ba24": "UBERON:0009835",
     }
+    
+    # Extract sequence
+    #===================
+    (chro, region_start, region_end, cntr, interval, 
+    region_rel_start, region_rel_end,
+    gene_start, gene_end, gene_rel_start,
+    gene_rel_end, seq 
+    )= process(loc_df=loc_df, scn1a_df = scn1a_df, fasta = fasta, win_len=1048576, reg = reg)
+    
+    #generate baseline
+    #======================
+    baseline,_ = expr_map(all_model=model, model_l = model_l, seq=seq, chro=chro, interval=interval, brain_terms=brain_terms)
+    base_mean = np.mean(baseline[gene_rel_start:gene_rel_end])
+    
+    # #Run ISM
+    # #=================
+    #Define mask
+    neg_thr = -0.03
+    neu_thr = (-0.03,0.05)
+    mask_df = mask(mode = mode, neg_thr = neg_thr, neu_thr = neu_thr,
+                   reg=reg, curr_df = curr_df)
+    mask_rel_pos = np.array(mask_df.index.unique())
+    
+    
+    # allowed alts per position from mask_df itself
+    alt_by_pos = []
+    ref_by_pos = []
+    for pos in mask_rel_pos:
+        sub = mask_df.loc[pos]
+        sub = sub.sort_values('alt')
+        ref_by_pos.append(sub['ref'].iloc[0])
+        alt_by_pos.append(sub['alt'].tolist())
+    
+    print('n positions:', len(mask_rel_pos))
+    print('total combos:', np.prod([len(x) for x in alt_by_pos]))
+    
+    # Combinatorial ISM
+    # =================
+    rows = []
+    
+    for combo in tqdm(itertools.product(*alt_by_pos), total=int(np.prod([len(x) for x in alt_by_pos]))):
+        
+        # mutate all selected positions at once
+        mut_seq = list(seq)
+        for pos, alt in zip(mask_rel_pos, combo):
+            mut_seq[pos] = alt
+        mut_seq = ''.join(mut_seq)
+        
+        # predict
+        point, fold_outs = expr_map(
+            all_model=model,
+            model_l=model_l,
+            seq=mut_seq,
+            chro=chro,
+            interval=interval,
+            brain_terms=brain_terms
+        )
+        
+        mut_mean = np.mean(point[gene_rel_start:gene_rel_end])
+        logFC = np.log2((mut_mean + 1e-8) / (base_mean + 1e-8))
+        sd = np.mean(np.std(fold_outs[:,gene_rel_start:gene_rel_end],axis=0))
+        
+        rows.append({
+            'reg': reg,
+            'mode': mode,
+            'positions': tuple(mask_rel_pos),
+            'refs': ''.join(ref_by_pos),
+            'alts': ''.join(combo),
+            'n_mut': len(combo),
+            'mut_mean': mut_mean,
+            'base_mean': base_mean,
+            'delta': mut_mean - base_mean,
+            'logFC': logFC,
+            'sd': sd
+        })
+    
+    comb_df = pd.DataFrame(rows).sort_values('logFC')
+    comb_df.to_csv(f'{fdata}/GENE_PREDICT/ISM/{reg}_{mode}_20bp_alphagenome.csv')
 
-    vdir = os.path.join(out_dir, sanitize(var))
-    os.makedirs(vdir, exist_ok=True)
 
-    for center_label, center_pos in centers.items():
-        start = center_pos - (seq_len // 2)
-        end   = center_pos + (seq_len // 2)
 
-        # encode WT and apply SNP (uses your mutate(wt_code, poses, alts) that depends on 'start')
-        wt_code = process_sequence(fasta_open, chrom, start, end)
-        mut_code = mutate(wt_code, [pos], [alt])
+reg_l = ['B2', 'B1', 'A1']
+df_l = [b2_df, b1_df, a1_df]
+mode_l = ['neg', 'neu']
 
-        # per-fold predictions and saves
-        cdir = os.path.join(vdir, center_label)
-        os.makedirs(cdir, exist_ok=True)
-
-        for fold_ix, mdl in enumerate(models):
-            y_wt  = predict_tracks([mdl], wt_code)   # (1,1,B,T)
-            y_mut = predict_tracks([mdl], mut_code)  # (1,1,B,T)
-
-            # aggregate brain channels → (B,)
-            wt_track  = brain_aggregate(y_wt, brain_idx)
-            mut_track = brain_aggregate(y_mut, brain_idx)
-            resid     = mut_track - wt_track
-
-            # genomic bin centers
-            B = y_wt.shape[2]
-            bp_per_bin = (end - start) / float(B)
-            x = start + bp_per_bin * (np.arange(B) + 0.5)
-
-            # save compact npz
-            np.savez(
-                os.path.join(cdir, f"fold{fold_ix}.npz"),
-                x=x, wt=wt_track, mut=mut_track, resid=resid,
-                chrom=chrom, start=start, end=end,
-                center_label=center_label, center_pos=center_pos,
-                variant=var, promoter=prom_name
-            )
-
-        print(f"Saved {var} @ {center_label} → {cdir}")
-
-print("Done. Compact per-fold results in:", out_dir)
+for g,reg in enumerate(reg_l):
+    curr_df = df_l[g]
+    for mode in mode_l: 
+        _run(reg,mode, curr_df)
+        print(f'Done {reg} for {mode}') 
